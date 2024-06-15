@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <ctime>
+#include <iostream>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -57,6 +58,16 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
         fprintf(stdout, "\n");*/
         llama_embd_normalize(embd, out, n_embd);
     }
+}
+
+template<typename T>
+static void print_binary_data(T* data, int64_t begin, int64_t end) {
+    const char *splitter = "";
+    for (auto i = begin; i < end; i++) {
+        std::cout << splitter << data[i];
+        splitter = ", ";
+    }
+    std::cout << std::endl;
 }
 
 int main(int argc, char ** argv) {
@@ -115,10 +126,12 @@ int main(int argc, char ** argv) {
     const uint64_t n_batch = params.n_batch;
     GGML_ASSERT(params.n_batch >= params.n_ctx);
 
+    printf("\ntoken ids:\n");
     // tokenize the prompts and trim
     std::vector<std::vector<int32_t>> inputs;
     for (const auto & prompt : prompts) {
         auto inp = ::llama_tokenize(ctx, prompt, true, false);
+        print_binary_data(inp.data(), 0, inp.size());
         if (inp.size() > n_batch) {
             fprintf(stderr, "%s: error: number of tokens in input line (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
                     __func__, (long long int) inp.size(), (long long int) n_batch);
@@ -126,6 +139,7 @@ int main(int argc, char ** argv) {
         }
         inputs.push_back(inp);
     }
+    std::cout << std::endl;
 
     // check if the last token is SEP
     // it should be automatically added by the tokenizer when 'tokenizer.ggml.add_eos_token' is set to 'true'
@@ -187,7 +201,7 @@ int main(int argc, char ** argv) {
     // print the first part of the embeddings or for a single prompt, the full embedding
     fprintf(stdout, "\n");
     for (int j = 0; j < n_prompts; j++) {
-        fprintf(stdout, "embedding %d: ", j);
+        fprintf(stdout, "\nembedding %d:\n", j);
         for (int i = 0; i < (n_prompts > 1 ? std::min(16, n_embd) : n_embd); i++) {
             fprintf(stdout, "%9.6f ", emb[j * n_embd + i]);
         }

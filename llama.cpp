@@ -225,6 +225,7 @@ enum llm_arch {
     LLM_ARCH_OLMO,
     LLM_ARCH_ARCTIC,
     LLM_ARCH_DEEPSEEK2,
+    LLM_ARCH_XLMROBERTA,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -263,6 +264,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OLMO,            "olmo"         },
     { LLM_ARCH_ARCTIC,          "arctic"       },
     { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
+    { LLM_ARCH_XLMROBERTA,      "xlm-roberta"  },    
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -672,6 +674,23 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
     },
     {
         LLM_ARCH_BERT,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_TOKEN_EMBD_NORM, "token_embd_norm" },
+            { LLM_TENSOR_TOKEN_TYPES,     "token_types" },
+            { LLM_TENSOR_POS_EMBD,        "position_embd" },
+            { LLM_TENSOR_ATTN_OUT_NORM,   "blk.%d.attn_output_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_LAYER_OUT_NORM,  "blk.%d.layer_output_norm" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+        },
+    },
+    {
+        LLM_ARCH_XLMROBERTA,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
             { LLM_TENSOR_TOKEN_EMBD_NORM, "token_embd_norm" },
@@ -4149,6 +4168,7 @@ static void llm_load_hparams(
                 hparams.f_max_alibi_bias = 8.0f;
             } break;
         case LLM_ARCH_BERT:
+        case LLM_ARCH_XLMROBERTA:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,    hparams.f_norm_eps);
                 ml.get_key(LLM_KV_ATTENTION_CAUSAL,           hparams.causal_attn);
@@ -5494,10 +5514,11 @@ static bool llm_load_tensors(
                 } break;
             case LLM_ARCH_BERT:
             case LLM_ARCH_NOMIC_BERT:
+            case LLM_ARCH_XLMROBERTA:
                 {
                     model.tok_embd     = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab});
                     model.type_embd    = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_vocab_type});
-                    if (model.arch == LLM_ARCH_BERT) {
+                    if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_XLMROBERTA) {
                         model.pos_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_POS_EMBD,    "weight"), {n_embd, hparams.n_ctx_train});
                     }
 
@@ -5510,7 +5531,7 @@ static bool llm_load_tensors(
 
                         auto & layer = model.layers[i];
 
-                        if (model.arch == LLM_ARCH_BERT) {
+                        if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_XLMROBERTA) {
                             layer.wq   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
                             layer.bq   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i),   {n_embd});
 
@@ -5531,7 +5552,7 @@ static bool llm_load_tensors(
                         layer.ffn_up          = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,        "weight", i), {n_embd, n_ff});
                         layer.ffn_down        = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN,      "weight", i), {n_ff, n_embd});
 
-                        if (model.arch == LLM_ARCH_BERT) {
+                        if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_XLMROBERTA) {
                             layer.bo         = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd});
                             layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff});
 
@@ -8424,7 +8445,7 @@ struct llm_build_context {
         // token types are hardcoded to zero ("Sentence A")
         struct ggml_tensor * type_row0 = ggml_view_1d(ctx0, model.type_embd, n_embd, 0);
         inpL = ggml_add(ctx0, inpL, type_row0);
-        if (model.arch == LLM_ARCH_BERT) {
+        if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_XLMROBERTA) {
             inpL = ggml_add(ctx0, ggml_get_rows(ctx0, model.pos_embd, inp_pos), inpL);
         }
         cb(inpL, "inp_embd", -1);
@@ -8445,7 +8466,7 @@ struct llm_build_context {
             struct ggml_tensor * Vcur;
 
             // self-attention
-            if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_JINA_BERT_V2) {
+            if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_JINA_BERT_V2 || model.arch == LLM_ARCH_XLMROBERTA) {
                 Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), model.layers[il].bq);
                 cb(Qcur, "Qcur", il);
 
@@ -8553,7 +8574,7 @@ struct llm_build_context {
             cb(ffn_inp, "ffn_inp", il);
 
             // feed-forward network
-            if (model.arch == LLM_ARCH_BERT) {
+            if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_XLMROBERTA) {
                 cur = llm_build_ffn(ctx0, cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
                         NULL,                      NULL,
@@ -11594,6 +11615,7 @@ static struct ggml_cgraph * llama_build_graph(
         case LLM_ARCH_BERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
+        case LLM_ARCH_XLMROBERTA:
             {
                 result = llm.build_bert();
             } break;
@@ -11750,8 +11772,17 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
     if (batch.pos && lctx.inp_pos) {
         const int64_t n_tokens = batch.n_tokens;
-
-        ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*ggml_element_size(lctx.inp_pos));
+        if (lctx.model.arch != LLM_ARCH_XLMROBERTA) {
+            ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*ggml_element_size(lctx.inp_pos));
+        } else {
+            std::vector<llama_pos> position_ids(n_tokens, 0);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                if (i == 0 || batch.pos[i] != 0) {
+                    position_ids[i] = batch.pos[i] + lctx.model.vocab.special_pad_id + 1;
+                }
+            }
+            ggml_backend_tensor_set(lctx.inp_pos, position_ids.data(), 0, n_tokens*ggml_element_size(lctx.inp_pos));
+        }
     }
 
     if (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -13201,58 +13232,34 @@ private:
 };
 
 struct llm_tokenizer_wpm {
-    llm_tokenizer_wpm(const llama_vocab & vocab): vocab(vocab) {}
+    llm_tokenizer_wpm(const llama_vocab & vocab): vocab(vocab) {
+        is_xlm_vocab = vocab.token_to_id.size() > 100000 &&
+            vocab.token_to_id.find("数据") != vocab.token_to_id.end();
+    }
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
-        const auto & token_map = vocab.token_to_id;
+        if (is_xlm_vocab) {
+            tokenize_xlm(text, output);
+        } else {
+            tokenize_default(text, output);
+        }
+    }
 
+    void tokenize_default(const std::string & text, std::vector<llama_vocab::id> & output) {
         // normalize and split by whitespace
-        std::vector<std::string> words = preprocess(text);
+        std::vector<std::string> words = preprocess_default(text);
 
         // bos token prepended already
 
         // find the longest tokens that form the words
         for (const std::string &word : words) {
-            // skip empty words
-            if (word.size() == 0) {
-                continue;
-            }
-
-            // prepend phantom space
-            const std::string word1 = "\xe2\x96\x81" + word;
-            const int n = word1.size();
-
-            const size_t current_tokens = output.size();
-
-            // we're at the start of a new word
-            // move through character position in word
-            for (int i = 0; i < n; ++i) {
-                // loop through possible match length
-                bool match = false;
-                for (int j = n; j > i; j--) {
-                    auto it = token_map.find(word1.substr(i, j - i));
-                    if (it != token_map.end()) {
-                        output.push_back(it->second);
-                        match = true;
-                        i = j - 1;
-                        break;
-                    }
-                }
-
-                if (!match) { // discard all
-                    output.resize(current_tokens);
-                    break;  // and discard next tokens
-                }
-            }
-
-            // we didn't find any matches for this word
-            if (current_tokens == output.size()) {
-                output.push_back(vocab.special_unk_id);
+            if (word.size() > 0) {
+                tokenize_word_default(word, output);
             }
         }
     }
 
-    std::vector<std::string> preprocess(const std::string & text) {
+    std::vector<std::string> preprocess_default(const std::string & text) {
         const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
         std::vector<std::string> words(1, "");
 
@@ -13290,6 +13297,151 @@ struct llm_tokenizer_wpm {
         return words;
     }
 
+    void tokenize_xlm(const std::string & text, std::vector<llama_vocab::id> & output) {
+        auto cpts_word_2_str = [](const std::vector<uint32_t> & cpts_word) {
+            std::string word;
+            for (auto c : cpts_word) {
+                word += unicode_cpt_to_utf8(c);
+            }
+            return word;
+        };
+
+        auto is_english_char = [](uint32_t cpt) {
+            const auto flags = unicode_cpt_flags(cpt);
+            return !(cpt == 0 || cpt == 0xFFFD || flags.is_control || flags.is_punctuation || 
+                    (cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt));
+        };
+
+        const auto & token_map = vocab.token_to_id;
+
+        // normalize and split by whitespace
+        auto all_cpts_words = preprocess_xlm(text);
+
+        // bos token prepended already
+
+        // find the longest tokens that form the words
+        for (int i = 0; i < (int)all_cpts_words.size(); ++i) {
+            const auto & cpts_word = all_cpts_words[i];
+            // skip empty words
+            if (cpts_word.size() == 0) {
+                continue;
+            }
+
+            std::string word = cpts_word_2_str(cpts_word);
+            if (cpts_word.size() != 1 || (cpts_word.size() == 1 && is_english_char(cpts_word[0]))) {
+                tokenize_word_default(word, output);
+                continue;
+            }
+
+            auto it = token_map.find(word);
+            auto token_id = it != token_map.end() ? it->second : vocab.special_unk_id;
+            if (token_id == vocab.special_unk_id) {
+                output.push_back(token_id);
+                continue;
+            }
+
+            auto j = i + 1;
+            for (; j < (int)all_cpts_words.size(); j++) {
+                const auto& next_cpts_word = all_cpts_words[j];
+                if (next_cpts_word.size() != 1 || (next_cpts_word.size() == 1 && is_english_char(next_cpts_word[0]))) {
+                    break;
+                }
+
+                auto next_word = cpts_word_2_str(next_cpts_word);
+                it = token_map.find(word + next_word);
+                auto token_id_2 = it != token_map.end() ? it->second : vocab.special_unk_id;;
+                if (token_id_2 == vocab.special_unk_id) {
+                    break;
+                }
+
+                token_id = token_id_2;
+                word += next_word;
+            }
+
+            output.push_back(token_id);
+            i = j - 1;
+        }
+    }
+
+    std::vector<std::vector<uint32_t>> preprocess_xlm(const std::string & text) {
+        std::vector<uint32_t> cpts_word;
+        std::vector<std::vector<uint32_t>> all_cpts_words;
+        const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+        for (const uint32_t cpt : cpts_nfd) {
+            const auto flags = unicode_cpt_flags(cpt);
+
+            if (flags.is_whitespace) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                continue;
+            }
+
+            assert (!flags.is_separator);
+            if (cpt == 0 || cpt == 0xFFFD || flags.is_control) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                continue;
+            }
+
+            if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                all_cpts_words.emplace_back(std::vector<uint32_t>{cpt});
+            }
+            else {
+                cpts_word.emplace_back(cpt);
+            }
+        }
+
+        if (!cpts_word.empty()) {
+            all_cpts_words.emplace_back(cpts_word);
+        }
+
+        return all_cpts_words;
+    }
+
+    void tokenize_word_default(const std::string & word, std::vector<llama_vocab::id> & output) {
+        const auto & token_map = vocab.token_to_id;
+
+        // prepend phantom space
+        const std::string word1 = "\xe2\x96\x81" + word;
+        const int n = word1.size();
+
+        const size_t current_tokens = output.size();
+
+        // we're at the start of a new word
+        // move through character position in word
+        for (int i = 0; i < n; ++i) {
+            // loop through possible match length
+            bool match = false;
+            for (int j = n; j > i; j--) {
+                auto it = token_map.find(word1.substr(i, j - i));
+                if (it != token_map.end()) {
+                    output.push_back(it->second);
+                    match = true;
+                    i = j - 1;
+                    break;
+                }
+            }
+
+            if (!match) { // discard all
+                output.resize(current_tokens);
+                break;  // and discard next tokens
+            }
+        }
+
+        // we didn't find any matches for this word
+        if (current_tokens == output.size()) {
+            output.push_back(vocab.special_unk_id);
+        }
+    }
+
     static bool is_chinese_char(uint32_t cpt) {
         return
             (cpt >= 0x04E00 && cpt <= 0x09FFF) ||
@@ -13304,7 +13456,8 @@ struct llm_tokenizer_wpm {
             //(cpt >= 0xFF00  && cpt <= 0xFFEF);
     }
 
-    const llama_vocab & vocab;
+    bool is_xlm_vocab;
+    const llama_vocab & vocab;   
 };
 
 typedef enum FRAGMENT_BUFFER_VARIANT_TYPE {
@@ -16479,6 +16632,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_GPTNEOX:
+        case LLM_ARCH_XLMROBERTA:
             return LLAMA_ROPE_TYPE_NEOX;
 
         // all model arches should be listed explicitly here
