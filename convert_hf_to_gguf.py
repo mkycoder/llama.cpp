@@ -470,7 +470,7 @@ class Model:
         return seems_special
 
     # used for GPT-2 BPE and WordPiece vocabs
-    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+    def get_vocab_base(self, tokpre=None) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
@@ -479,7 +479,8 @@ class Model:
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
         assert max(tokenizer.vocab.values()) < vocab_size
 
-        tokpre = self.get_vocab_base_pre(tokenizer)
+        if not tokpre:
+            tokpre = self.get_vocab_base_pre(tokenizer)
 
         reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}
         added_vocab = tokenizer.get_added_vocab()
@@ -2455,6 +2456,67 @@ class BertModel(Model):
                 return tok[2:]
             return "\u2581" + tok
         tokens = list(map(phantom, tokens))
+
+        # add vocab to gguf
+        self.gguf_writer.add_tokenizer_model("bert")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        # handle special tokens
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid  # unused
+
+        # we are only using BERT for embeddings so we don't need the pooling layer
+        if name in ("embeddings.position_ids", "pooler.dense.weight", "pooler.dense.bias"):
+            return [] # we don't need these
+
+        return [(self.map_tensor_name(name), data_torch)]
+
+
+@Model.register("XLMRobertaModel")
+class XLMRobertaModel(Model):
+    model_arch = gguf.MODEL_ARCH.XLMROBERTA
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vocab_size = None
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_causal_attention(False)
+
+        # get pooling path
+        pooling_path = None
+        module_path = self.dir_model / "modules.json"
+        if module_path.is_file():
+            with open(module_path, encoding="utf-8") as f:
+                modules = json.load(f)
+            for mod in modules:
+                if mod["type"] == "sentence_transformers.models.Pooling":
+                    pooling_path = mod["path"]
+                    break
+
+        # get pooling type
+        if pooling_path is not None:
+            with open(self.dir_model / pooling_path / "config.json", encoding="utf-8") as f:
+                pooling = json.load(f)
+            if pooling["pooling_mode_mean_tokens"]:
+                pooling_type = gguf.PoolingType.MEAN
+            elif pooling["pooling_mode_cls_token"]:
+                pooling_type = gguf.PoolingType.CLS
+            else:
+                raise NotImplementedError("Only MEAN and CLS pooling types supported")
+            self.gguf_writer.add_pooling_type(pooling_type)
+
+    def set_vocab(self):
+        tokens, toktypes, tokpre = self.get_vocab_base('default')
+        self.vocab_size = len(tokens)
+
+        self.gguf_writer.add_token_type_count(int(self.hparams['type_vocab_size']))
 
         # add vocab to gguf
         self.gguf_writer.add_tokenizer_model("bert")
