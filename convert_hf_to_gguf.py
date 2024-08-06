@@ -470,7 +470,7 @@ class Model:
         return seems_special
 
     # used for GPT-2 BPE and WordPiece vocabs
-    def get_vocab_base(self, tokpre=None) -> tuple[list[str], list[int], str]:
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
@@ -479,8 +479,7 @@ class Model:
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
         assert max(tokenizer.vocab.values()) < vocab_size
 
-        if not tokpre:
-            tokpre = self.get_vocab_base_pre(tokenizer)
+        tokpre = self.get_vocab_base_pre(tokenizer)
 
         reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}
         added_vocab = tokenizer.get_added_vocab()
@@ -2513,20 +2512,10 @@ class XLMRobertaModel(Model):
             self.gguf_writer.add_pooling_type(pooling_type)
 
     def set_vocab(self):
-        tokens, toktypes, tokpre = self.get_vocab_base('default')
-        self.vocab_size = len(tokens)
-
+        self._set_vocab_sentencepiece()
         self.gguf_writer.add_token_type_count(int(self.hparams['type_vocab_size']))
-
-        # add vocab to gguf
-        self.gguf_writer.add_tokenizer_model("bert")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        # handle special tokens
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+        self.gguf_writer.add_add_bos_token(True)
+        self.gguf_writer.add_add_eos_token(True)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
@@ -2536,6 +2525,105 @@ class XLMRobertaModel(Model):
             return [] # we don't need these
 
         return [(self.map_tensor_name(name), data_torch)]
+    
+    def _set_vocab_sentencepiece(self, add_to_gguf=True):
+        tokens, scores, toktypes = self._create_vocab_sentencepiece()
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def _create_vocab_sentencepiece(self):
+        from sentencepiece import SentencePieceProcessor
+
+        tokenizer_path = self.dir_model / 'tokenizer.model'
+        if not tokenizer_path.is_file():
+            tokenizer_path = self.dir_model / 'sentencepiece.bpe.model'
+            if not tokenizer_path.is_file():
+                raise FileNotFoundError(f"File not found: {tokenizer_path}")
+
+        tokenizer = SentencePieceProcessor()
+        tokenizer.LoadFromFile(str(tokenizer_path))
+
+        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+
+        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+        scores: list[float] = [-10000.0] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+        for token_id in range(tokenizer.vocab_size()):
+            piece = tokenizer.IdToPiece(token_id)
+            text = piece.encode("utf-8")
+            score = tokenizer.GetScore(token_id)
+
+            toktype = SentencePieceTokenTypes.NORMAL
+            if tokenizer.IsUnknown(token_id):
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif tokenizer.IsControl(token_id):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif tokenizer.IsUnused(token_id):
+                toktype = SentencePieceTokenTypes.UNUSED
+            elif tokenizer.IsByte(token_id):
+                toktype = SentencePieceTokenTypes.BYTE
+
+            # the first four token should be <s>, <pad>, </s>, <unk> vocabulary of E5,
+            # but there are <s>, <pad>, </s>, "," in the sentencepiece model
+            # so add the reserve the first four token
+            tokens[token_id+1] = text
+            scores[token_id+1] = score
+            toktypes[token_id+1] = toktype
+        
+        tokens[0] = '<s>'.encode("utf-8")
+        scores[0] = 0
+        toktypes[0] = SentencePieceTokenTypes.NORMAL
+
+        added_tokens_file = self.dir_model / 'added_tokens.json'
+        if added_tokens_file.is_file():
+            with open(added_tokens_file, "r", encoding="utf-8") as f:
+                added_tokens_json = json.load(f)
+                for key in added_tokens_json:
+                    token_id = added_tokens_json[key]
+                    if token_id >= vocab_size:
+                        logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
+                        continue
+
+                    tokens[token_id] = key.encode("utf-8")
+                    scores[token_id] = -1000.0
+                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        if tokenizer_config_file.is_file():
+            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+                added_tokens_decoder = tokenizer_config_json.get("added_tokens_decoder", {})
+                for token_id, token_data in added_tokens_decoder.items():
+                    token_id = int(token_id)
+                    token: str = token_data["content"]
+                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
+                        if tokens[token_id] != token.encode("utf-8"):
+                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token!r}')
+                    if token_data.get("special") or self.does_token_look_special(token):
+                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+                    else:
+                        token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")  # pre-normalize user-defined spaces
+                        toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+
+                    scores[token_id] = -1000.0
+                    tokens[token_id] = token.encode("utf-8")
+
+        if vocab_size > len(tokens):
+            pad_count = vocab_size - len(tokens)
+            logger.debug(f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]")
+            for i in range(1, pad_count + 1):
+                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
+                scores.append(-1000.0)
+                toktypes.append(SentencePieceTokenTypes.UNUSED)
+
+        return tokens, scores, toktypes
 
 
 @Model.register("NomicBertModel")
