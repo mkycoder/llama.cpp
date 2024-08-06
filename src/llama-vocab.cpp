@@ -201,8 +201,23 @@ struct llm_bigram_spm {
     size_t size;
 };
 
-struct llm_tokenizer_spm {
-    llm_tokenizer_spm(const llama_vocab & vocab) : vocab(vocab) {}
+
+static bool is_chinese_char(uint32_t cpt) {
+    return
+        (cpt >= 0x04E00 && cpt <= 0x09FFF) ||
+        (cpt >= 0x03400 && cpt <= 0x04DBF) ||
+        (cpt >= 0x20000 && cpt <= 0x2A6DF) ||
+        (cpt >= 0x2A700 && cpt <= 0x2B73F) ||
+        (cpt >= 0x2B740 && cpt <= 0x2B81F) ||
+        (cpt >= 0x2B920 && cpt <= 0x2CEAF) || // this should be 0x2B820 but in hf rust code it is 0x2B920
+        (cpt >= 0x0F900 && cpt <= 0x0FAFF) ||
+        (cpt >= 0x2F800 && cpt <= 0x2FA1F);
+        //(cpt >= 0x3000  && cpt <= 0x303F)  ||
+        //(cpt >= 0xFF00  && cpt <= 0xFFEF);
+}
+
+struct llm_tokenizer_spm_en {
+    llm_tokenizer_spm_en(const llama_vocab & vocab) : vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
         // split string into utf8 chars
@@ -325,6 +340,113 @@ private:
     llm_bigram_spm::queue work_queue;
 
     std::map<std::string, std::pair<int, int>> rev_merge;
+};
+
+struct llm_tokenizer_spm {
+    llm_tokenizer_spm(const llama_vocab & vocab) : vocab(vocab) {}
+
+    void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
+        auto cpts_word_2_str = [](const std::vector<uint32_t> & cpts_word) {
+            std::string word;
+            for (auto c : cpts_word) {
+                word += unicode_cpt_to_utf8(c);
+            }
+            return word;
+        };
+
+        auto is_english_char = [](uint32_t cpt) {
+            const auto flags = unicode_cpt_flags(cpt);
+            return !(cpt == 0 || cpt == 0xFFFD || flags.is_control || flags.is_punctuation || 
+                    (cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt));
+        };
+
+        const auto & token_map = vocab.token_to_id;
+
+        // normalize and split by whitespace
+        auto all_cpts_words = preprocess(text);
+
+        // find the longest tokens that form the words
+        for (int i = 0; i < (int)all_cpts_words.size(); ++i) {
+            const auto & cpts_word = all_cpts_words[i];
+            // skip empty words
+            if (cpts_word.size() == 0) {
+                continue;
+            }
+
+            std::string word = cpts_word_2_str(cpts_word);
+            if (cpts_word.size() != 1 || (cpts_word.size() == 1 && is_english_char(cpts_word[0]))) {
+                llm_tokenizer_spm_en en_tokenizer(vocab);
+                en_tokenizer.tokenize(word, output);
+                continue;
+            }
+
+            auto it = token_map.find(word);
+            auto token_id = it != token_map.end() ? it->second : vocab.special_unk_id;
+
+            int end = std::min(i + vocab.max_token_len, (int)all_cpts_words.size());
+            for (int j = i + 1; j < end; j++) {
+                const auto& next_cpts_word = all_cpts_words[j];
+                if (next_cpts_word.size() != 1 || (next_cpts_word.size() == 1 && is_english_char(next_cpts_word[0]))) {
+                    break;
+                }
+
+                word += cpts_word_2_str(next_cpts_word);
+                it = token_map.find(word);
+                if (it != token_map.end()) {
+                    token_id = it->second;
+                    i = j;
+                }
+            }
+
+            output.push_back(token_id);
+        }
+    }
+
+private:
+    std::vector<std::vector<uint32_t>> preprocess(const std::string & text) {
+        std::vector<uint32_t> cpts_word;
+        std::vector<std::vector<uint32_t>> all_cpts_words;
+        const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+        for (const uint32_t cpt : cpts_nfd) {
+            const auto flags = unicode_cpt_flags(cpt);
+
+            if (flags.is_whitespace) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                continue;
+            }
+
+            GGML_ASSERT (!flags.is_separator);
+            if (cpt == 0 || cpt == 0xFFFD || flags.is_control) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                continue;
+            }
+
+            if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
+                if (!cpts_word.empty()) {
+                    all_cpts_words.emplace_back(cpts_word);
+                    cpts_word.clear();
+                }
+                all_cpts_words.emplace_back(std::vector<uint32_t>{cpt});
+            }
+            else {
+                cpts_word.emplace_back(cpt);
+            }
+        }
+
+        if (!cpts_word.empty()) {
+            all_cpts_words.emplace_back(cpts_word);
+        }
+
+        return all_cpts_words;
+    }
+
+    const llama_vocab & vocab;
 };
 
 //
@@ -644,45 +766,59 @@ private:
 //
 
 struct llm_tokenizer_wpm {
-    llm_tokenizer_wpm(const llama_vocab & vocab): vocab(vocab) {
-        if (vocab.token_to_id.size() > 100000 && vocab.token_to_id.find("数据") != vocab.token_to_id.end()) {
-            is_xlm_vocab = true;
-            for (auto & token : vocab.id_to_token) {
-                if (token.text.find_first_of("▁") == 0) {
-                    continue;
-                }
+    llm_tokenizer_wpm(const llama_vocab & vocab): vocab(vocab) {}
 
-                auto cpts = unicode_cpts_from_utf8(token.text);
-                if (cpts.size() > max_cn_word_length && is_chinese_char(cpts[0])) {
-                    max_cn_word_length = cpts.size();
-                }
-            }
-        }
-    }
+    void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) const {
+        const auto & token_map = vocab.token_to_id;
 
-    void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
-        if (is_xlm_vocab) {
-            tokenize_xlm(text, output);
-        } else {
-            tokenize_default(text, output);
-        }
-    }
-
-    void tokenize_default(const std::string & text, std::vector<llama_vocab::id> & output) {
         // normalize and split by whitespace
-        std::vector<std::string> words = preprocess_default(text);
+        std::vector<std::string> words = preprocess(text);
 
         // bos token prepended already
 
         // find the longest tokens that form the words
-        for (const std::string &word : words) {
-            if (word.size() > 0) {
-                tokenize_word_default(word, output);
+        for (const std::string & word : words) {
+            // skip empty words
+            if (word.size() == 0) {
+                continue;
+            }
+
+            // prepend phantom space
+            const std::string word1 = "\xe2\x96\x81" + word;
+            const int n = word1.size();
+
+            const size_t current_tokens = output.size();
+
+            // we're at the start of a new word
+            // move through character position in word
+            for (int i = 0; i < n; ++i) {
+                // loop through possible match length
+                bool match = false;
+                for (int j = std::min(n, i + vocab.max_token_len + 1); j > i; j--) {
+                    auto it = token_map.find(word1.substr(i, j - i));
+                    if (it != token_map.end()) {
+                        output.push_back(it->second);
+                        match = true;
+                        i = j - 1;
+                        break;
+                    }
+                }
+
+                if (!match) { // discard all
+                    output.resize(current_tokens);
+                    break;  // and discard next tokens
+                }
+            }
+
+            // we didn't find any matches for this word
+            if (current_tokens == output.size()) {
+                output.push_back(vocab.special_unk_id);
             }
         }
     }
 
-    std::vector<std::string> preprocess_default(const std::string & text) {
+    // TODO: reduce string copies by using cpts_offs array
+    std::vector<std::string> preprocess(const std::string & text) const {
         const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
         std::vector<std::string> words(1, "");
 
@@ -720,159 +856,6 @@ struct llm_tokenizer_wpm {
         return words;
     }
 
-    void tokenize_xlm(const std::string & text, std::vector<llama_vocab::id> & output) {
-        auto cpts_word_2_str = [](const std::vector<uint32_t> & cpts_word) {
-            std::string word;
-            for (auto c : cpts_word) {
-                word += unicode_cpt_to_utf8(c);
-            }
-            return word;
-        };
-
-        auto is_english_char = [](uint32_t cpt) {
-            const auto flags = unicode_cpt_flags(cpt);
-            return !(cpt == 0 || cpt == 0xFFFD || flags.is_control || flags.is_punctuation || 
-                    (cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt));
-        };
-
-        const auto & token_map = vocab.token_to_id;
-
-        // normalize and split by whitespace
-        auto all_cpts_words = preprocess_xlm(text);
-
-        // bos token prepended already
-
-        // find the longest tokens that form the words
-        for (int i = 0; i < (int)all_cpts_words.size(); ++i) {
-            const auto & cpts_word = all_cpts_words[i];
-            // skip empty words
-            if (cpts_word.size() == 0) {
-                continue;
-            }
-
-            std::string word = cpts_word_2_str(cpts_word);
-            if (cpts_word.size() != 1 || (cpts_word.size() == 1 && is_english_char(cpts_word[0]))) {
-                tokenize_word_default(word, output);
-                continue;
-            }
-
-            auto it = token_map.find(word);
-            auto token_id = it != token_map.end() ? it->second : vocab.special_unk_id;
-
-            int end = std::min(i + max_cn_word_length, (int)all_cpts_words.size());
-            for (int j = i + 1; j < end; j++) {
-                const auto& next_cpts_word = all_cpts_words[j];
-                if (next_cpts_word.size() != 1 || (next_cpts_word.size() == 1 && is_english_char(next_cpts_word[0]))) {
-                    break;
-                }
-
-                word += cpts_word_2_str(next_cpts_word);
-                it = token_map.find(word);
-                if (it != token_map.end()) {
-                    token_id = it->second;
-                    i = j;
-                }
-            }
-
-            output.push_back(token_id);
-        }
-    }
-
-    std::vector<std::vector<uint32_t>> preprocess_xlm(const std::string & text) {
-        std::vector<uint32_t> cpts_word;
-        std::vector<std::vector<uint32_t>> all_cpts_words;
-        const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
-        for (const uint32_t cpt : cpts_nfd) {
-            const auto flags = unicode_cpt_flags(cpt);
-
-            if (flags.is_whitespace) {
-                if (!cpts_word.empty()) {
-                    all_cpts_words.emplace_back(cpts_word);
-                    cpts_word.clear();
-                }
-                continue;
-            }
-
-            assert (!flags.is_separator);
-            if (cpt == 0 || cpt == 0xFFFD || flags.is_control) {
-                if (!cpts_word.empty()) {
-                    all_cpts_words.emplace_back(cpts_word);
-                    cpts_word.clear();
-                }
-                continue;
-            }
-
-            if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
-                if (!cpts_word.empty()) {
-                    all_cpts_words.emplace_back(cpts_word);
-                    cpts_word.clear();
-                }
-                all_cpts_words.emplace_back(std::vector<uint32_t>{cpt});
-            }
-            else {
-                cpts_word.emplace_back(cpt);
-            }
-        }
-
-        if (!cpts_word.empty()) {
-            all_cpts_words.emplace_back(cpts_word);
-        }
-
-        return all_cpts_words;
-    }
-
-    void tokenize_word_default(const std::string & word, std::vector<llama_vocab::id> & output) {
-        const auto & token_map = vocab.token_to_id;
-
-        // prepend phantom space
-        const std::string word1 = "\xe2\x96\x81" + word;
-        const int n = word1.size();
-
-        const size_t current_tokens = output.size();
-
-        // we're at the start of a new word
-        // move through character position in word
-        for (int i = 0; i < n; ++i) {
-            // loop through possible match length
-            bool match = false;
-            for (int j = n; j > i; j--) {
-                auto it = token_map.find(word1.substr(i, j - i));
-                if (it != token_map.end()) {
-                    output.push_back(it->second);
-                    match = true;
-                    i = j - 1;
-                    break;
-                }
-            }
-
-            if (!match) { // discard all
-                output.resize(current_tokens);
-                break;  // and discard next tokens
-            }
-        }
-
-        // we didn't find any matches for this word
-        if (current_tokens == output.size()) {
-            output.push_back(vocab.special_unk_id);
-        }
-    }
-
-    static bool is_chinese_char(uint32_t cpt) {
-        return
-            (cpt >= 0x04E00 && cpt <= 0x09FFF) ||
-            (cpt >= 0x03400 && cpt <= 0x04DBF) ||
-            (cpt >= 0x20000 && cpt <= 0x2A6DF) ||
-            (cpt >= 0x2A700 && cpt <= 0x2B73F) ||
-            (cpt >= 0x2B740 && cpt <= 0x2B81F) ||
-            (cpt >= 0x2B920 && cpt <= 0x2CEAF) || // this should be 0x2B820 but in hf rust code it is 0x2B920
-            (cpt >= 0x0F900 && cpt <= 0x0FAFF) ||
-            (cpt >= 0x2F800 && cpt <= 0x2FA1F);
-            //(cpt >= 0x3000  && cpt <= 0x303F)  ||
-            //(cpt >= 0xFF00  && cpt <= 0xFFEF);
-    }
-
-    bool is_xlm_vocab = false;
-    int max_cn_word_length = 0;
     const llama_vocab & vocab;
 };
 
