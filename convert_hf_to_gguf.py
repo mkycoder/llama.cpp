@@ -2526,7 +2526,7 @@ class XLMRobertaModel(Model):
 
         return [(self.map_tensor_name(name), data_torch)]
     
-    def _set_vocab_sentencepiece(self, add_to_gguf=True):
+    def _set_vocab_sentencepiece(self):
         tokens, scores, toktypes = self._create_vocab_sentencepiece()
 
         self.gguf_writer.add_tokenizer_model("llama")
