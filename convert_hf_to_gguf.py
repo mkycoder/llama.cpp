@@ -2530,7 +2530,7 @@ class XLMRobertaModel(Model):
         tokens, scores, toktypes = self._create_vocab_sentencepiece()
 
         self.gguf_writer.add_tokenizer_model("llama")
-        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_tokenizer_pre("multilingual-e5")
         self.gguf_writer.add_token_list(tokens)
         self.gguf_writer.add_token_scores(scores)
         self.gguf_writer.add_token_types(toktypes)

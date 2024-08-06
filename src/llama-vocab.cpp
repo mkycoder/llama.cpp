@@ -216,8 +216,8 @@ static bool is_chinese_char(uint32_t cpt) {
         //(cpt >= 0xFF00  && cpt <= 0xFFEF);
 }
 
-struct llm_tokenizer_spm_en {
-    llm_tokenizer_spm_en(const llama_vocab & vocab) : vocab(vocab) {}
+struct llm_tokenizer_spm_default {
+    llm_tokenizer_spm_default(const llama_vocab & vocab) : vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
         // split string into utf8 chars
@@ -346,6 +346,12 @@ struct llm_tokenizer_spm {
     llm_tokenizer_spm(const llama_vocab & vocab) : vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
+        if (vocab.type_pre != LLAMA_VOCAB_PRE_TYPE_ML_E5) {
+            llm_tokenizer_spm_default default_tokenizer(vocab);
+            default_tokenizer.tokenize(text, output);
+            return;
+        }
+
         auto cpts_word_2_str = [](const std::vector<uint32_t> & cpts_word) {
             std::string word;
             for (auto c : cpts_word) {
@@ -375,8 +381,8 @@ struct llm_tokenizer_spm {
 
             std::string word = cpts_word_2_str(cpts_word);
             if (cpts_word.size() != 1 || (cpts_word.size() == 1 && is_english_char(cpts_word[0]))) {
-                llm_tokenizer_spm_en en_tokenizer(vocab);
-                en_tokenizer.tokenize(word, output);
+                llm_tokenizer_spm_default default_tokenizer(vocab);
+                default_tokenizer.tokenize(word, output);
                 continue;
             }
 

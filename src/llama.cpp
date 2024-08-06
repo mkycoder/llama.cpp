@@ -5464,7 +5464,12 @@ static void llm_load_vocab(
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
             }
         } else if (vocab.type == LLAMA_VOCAB_TYPE_SPM) {
-            vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
+            if (tokenizer_pre == "multilingual-e5") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_ML_E5;
+            } else {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
+            }
+
             vocab.tokenizer_add_space_prefix = true;
             vocab.tokenizer_clean_spaces = false;
             vocab.tokenizer_add_bos = true;
